@@ -3,6 +3,7 @@ import RPi.GPIO as GPIO
 import time
 import random
 import sys
+import struct
 from colour import Color
 from spidev import SpiDev
 from enum import IntEnum, Enum
@@ -145,11 +146,12 @@ class Driver:
         bin_data += '1' if self.parity_error else '0'
         bin_data += '1' if self.thermal_error else '0'
         bin_data += '1' if self.pwm_bitcount == Driver.PWM_12BIT else '0'
+        bin_data += format(self.pwm_counting_mode, '0>2b')
         bin_data += '1' if self.pwm_sync_mode == Driver.PWM_SYNC_MANUAL else '0'
         bin_data += format(self.current_gain, '0>8b')
         bin_data += '1' if self.thermal_protection else '0'
         bin_data += '1' if self.timeout_alert else '0'
-        return bin_data
+        return [int(bin_data[0:8], 2), int(bin_data[8:16], 2)]
 
 
 
@@ -159,7 +161,7 @@ class Controller:
         self.isPowered = False
         self.spi = SPI()
         self.soft_spi = SoftSPI()
-        self.drivers = [Driver()] * 12
+        self.drivers = [Driver() for i in range(0, 12)]
 
         random.seed()
 
@@ -171,22 +173,25 @@ class Controller:
         GPIO.setup(channel=Pins.LE, direction=GPIO.OUT, initial=GPIO.LOW)
         GPIO.setup(Pins.SCLK_DOUBLE, GPIO.IN, GPIO.PUD_UP)
 
-    def check_driver_config_writing(self): # TODO: Doesn't work
-        check_data = [('red', 0), ('green', 100), ('blue', 200)]
-        for color, value in check_data:
+    def check_driver_config_writing(self):
+        print ('Checking driver configuration writing and reading')
+        current_gains = [('red', 0), ('green', 100), ('blue', 200)]
+        for color, value in current_gains:
             for driver in self.__get_driver(color):
                 driver.current_gain = value
-        drivers_value = [int(driver.get_data()) for driver in self.drivers]
-        self.write_drivers(drivers_value, LE_Position.WRITE_CONFIG)
+        driver_values = []
+        for driver in self.drivers:
+            driver_values.extend(driver.get_data())
+        self.write_drivers(driver_values, LE_Position.WRITE_CONFIG)
         for driver in self.drivers:
             driver.current_gain = -1
         data = self.read_drivers(LE_Position.READ_CONFIG)
         for i, driver in enumerate(self.drivers):
-            driver.set_data([data[i * 2], data[i * 2 + 1]])
-        for color, value in check_data:
+            driver.set_data([data.pop(0), data.pop(0)])
+        for color, value in current_gains:
             for i, driver in enumerate(self.__get_driver(color)):
                 if driver.current_gain != value:
-                    self.error('Driver {0} N {1} write config failed. Expected: {2}; Found: {3}'
+                    self.error('Driver {0} {1} write config failed. Expected: {2}; Found: {3}'
                                .format(color, i, value, driver.current_gain))
 
     def togglePower(self, state):
@@ -224,7 +229,7 @@ class Controller:
         elif color == 'red':
             color_offset = 8
         if number == -1:
-            return self.drivers[color_offset : color_offset + 4]
+            return self.drivers[color_offset : (color_offset + 4)]
         return self.drivers[color_offset + number]
 
     def read_drivers(self, latch_position=0):
