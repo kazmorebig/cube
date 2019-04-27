@@ -3,9 +3,9 @@ import RPi.GPIO as GPIO
 import time
 import random
 import sys
-import struct
+from colour import Color
 from spidev import SpiDev
-from enum import IntEnum
+from enum import IntEnum, Enum
 
 class LoopTestException(Exception):
     pass
@@ -18,6 +18,13 @@ class Pins(IntEnum):
     MOSI = 10
     SCK = 11
 
+class LE_Position(IntEnum):
+    GLOBAL_LATCH = 3
+    READ_CONFIG = 5
+    EN_ERROR_DETECTION = 7
+    READ_ERROR_CODE = 9
+    WRITE_CONFIG = 11
+
 class SoftSPI:
     def __init__(self):
         pass
@@ -28,30 +35,28 @@ class SoftSPI:
 
     def writebytes(self, data, latch_position=0):
         self.open()
-        bitcount = 0
+        bitcount = len(data) * 8
         for byte in data:
-            read_byte = 0
             byte_string = format(byte, '0>8b')
             for j, bit in enumerate(byte_string):
-                bitcount += 1
                 gpio_state = GPIO.HIGH if bit == '1' else GPIO.LOW
                 GPIO.output(Pins.SCK, GPIO.LOW)
                 GPIO.output(Pins.MOSI, gpio_state)
                 if latch_position == bitcount:
                     GPIO.output(Pins.LE, GPIO.HIGH)
                 GPIO.output(Pins.SCK, GPIO.HIGH)
+                bitcount -= 1
         GPIO.output(Pins.LE, GPIO.LOW)
         self.close()
 
     def xfer(self, data, latch_position=0):
         self.open()
         result = []
-        bitcount = 0
+        bitcount = len(data) * 8
         for byte in data:
             read_byte = 0
             byte_string = format(byte, '0>8b')
             for j, bit in enumerate(byte_string):
-                bitcount += 1
                 gpio_state = GPIO.HIGH if bit == '1' else GPIO.LOW
                 GPIO.output(Pins.SCK, GPIO.LOW)
                 GPIO.output(Pins.MOSI, gpio_state)
@@ -59,6 +64,7 @@ class SoftSPI:
                 if latch_position == bitcount:
                     GPIO.output(Pins.LE, GPIO.HIGH)
                 GPIO.output(Pins.SCK, GPIO.HIGH)
+                bitcount -= 1
             result.append(read_byte)
         GPIO.output(Pins.LE, GPIO.LOW)
         self.close()
@@ -94,9 +100,6 @@ class SPI:
         result = self.spidev.xfer2(values)
         self.spidev.close()
         return result
-
-
-
 
 class Driver:
     PWM_SYNC_AUTO = 0
@@ -149,6 +152,7 @@ class Driver:
         return bin_data
 
 
+
 class Controller:
     def __init__(self):
         self.power_pin = 5
@@ -156,6 +160,7 @@ class Controller:
         self.spi = SPI()
         self.soft_spi = SoftSPI()
         self.drivers = [Driver()] * 12
+
         random.seed()
 
     def configure(self):
@@ -165,6 +170,24 @@ class Controller:
         GPIO.setup(channel=Pins.POWER, direction=GPIO.OUT, initial=GPIO.HIGH)
         GPIO.setup(channel=Pins.LE, direction=GPIO.OUT, initial=GPIO.LOW)
         GPIO.setup(Pins.SCLK_DOUBLE, GPIO.IN, GPIO.PUD_UP)
+
+    def check_driver_config_writing(self): # TODO: Doesn't work
+        check_data = [('red', 0), ('green', 100), ('blue', 200)]
+        for color, value in check_data:
+            for driver in self.__get_driver(color):
+                driver.current_gain = value
+        drivers_value = [int(driver.get_data()) for driver in self.drivers]
+        self.write_drivers(drivers_value, LE_Position.WRITE_CONFIG)
+        for driver in self.drivers:
+            driver.current_gain = -1
+        data = self.read_drivers(LE_Position.READ_CONFIG)
+        for i, driver in enumerate(self.drivers):
+            driver.set_data([data[i * 2], data[i * 2 + 1]])
+        for color, value in check_data:
+            for i, driver in enumerate(self.__get_driver(color)):
+                if driver.current_gain != value:
+                    self.error('Driver {0} N {1} write config failed. Expected: {2}; Found: {3}'
+                               .format(color, i, value, driver.current_gain))
 
     def togglePower(self, state):
         self.isPowered = state
@@ -185,13 +208,32 @@ class Controller:
 
     def checkDefaults(self):
         print ('Checking drivers default settings')
-        self.soft_spi.xfer([0], 5)
-        defaults = self.soft_spi.xfer([0]*24, 0)
+        defaults = self.read_drivers(LE_Position.READ_CONFIG)
         default_driver = Driver()
         for i, driver in enumerate(self.drivers):
             driver.set_data([defaults[i * 2], defaults[i * 2 + 1]])
             if driver != default_driver:
                 self.error('Driver {0} settings are not in default state. Data: {1}'.format(i, driver.get_data()))
+
+    def __get_driver(self, color = '', number = -1): #TODO: check it
+        if number < -1 or number > 3:
+            return None
+        color_offset = 0
+        if color == 'green':
+            color_offset = 4
+        elif color == 'red':
+            color_offset = 8
+        if number == -1:
+            return self.drivers[color_offset : color_offset + 4]
+        return self.drivers[color_offset + number]
+
+    def read_drivers(self, latch_position=0):
+        self.soft_spi.xfer([0, 0], latch_position)
+        data = self.soft_spi.xfer([0]*24, 0)
+        return data
+
+    def write_drivers(self, data, latch_position=0):
+        self.soft_spi.writebytes(data, latch_position)
 
     def error(self, message):
         print('ERROR: ' + message)
@@ -209,4 +251,5 @@ if __name__ == '__main__':
     time.sleep(1)
     controller.checkLoop()
     controller.checkDefaults()
+    controller.check_driver_config_writing()
     controller.togglePower(False)
